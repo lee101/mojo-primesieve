@@ -42,6 +42,33 @@ def fill_ones(flags: BPtr, n: Int):
         i += 1
 
 
+def fill_presieved(flags: BPtr, low: Int, n: Int):
+    comptime W = simdwidthof[DType.float64]()
+    comptime BYTE_W = 8 * W
+    comptime VECTORS = 15
+    comptime BLOCK = BYTE_W * VECTORS
+    var prefix = min(n, BLOCK)
+    var i = 0
+    while i < prefix:
+        var value = low + 2 * i
+        flags[i] = UInt8(value % 3 != 0 and value % 5 != 0)
+        i += 1
+    while i + BLOCK <= n:
+        comptime for vector in range(VECTORS):
+            flags.store(
+                i + vector * BYTE_W,
+                flags.load[width=BYTE_W](vector * BYTE_W),
+            )
+        i += BLOCK
+    while i < n:
+        flags[i] = flags[i % BLOCK]
+        i += 1
+    if low <= 3 and 3 <= low + 2 * (n - 1):
+        flags[(3 - low) // 2] = 1
+    if low <= 5 and 5 <= low + 2 * (n - 1):
+        flags[(5 - low) // 2] = 1
+
+
 def count_ones(flags: BPtr, n: Int) -> Int:
     comptime W = simdwidthof[DType.float64]()
     comptime BYTE_W = 8 * W
@@ -65,10 +92,14 @@ def sieve_segment(
     flags: BPtr,
     n: Int,
 ) -> Int:
-    fill_ones(flags, n)
+    var presieved = nbase > 10000
+    if presieved:
+        fill_presieved(flags, low, n)
+    else:
+        fill_ones(flags, n)
     for i in range(nbase):
         var p = Int(base[i])
-        if p == 2:
+        if p == 2 or (presieved and p <= 5):
             continue
         if p > high // p:
             break
@@ -253,6 +284,36 @@ def mps_collect_batch(
         for segment in range(nsegments):
             work(segment)
     return 0
+
+
+@export("mps_select_flag")
+def mps_select_flag(
+    low: Int,
+    flags_addr: Int,
+    n: Int,
+    rank: Int,
+) abi("C") -> Int:
+    if low < 3 or low % 2 == 0 or n < 1 or rank < 1 or flags_addr == 0:
+        return -1
+    comptime W = simdwidthof[DType.float64]()
+    comptime BYTE_W = 8 * W
+    var flags = BPtr(unsafe_from_address=flags_addr)
+    var remaining = rank
+    var i = 0
+    while i + BYTE_W <= n:
+        var block_count = Int(flags.load[width=BYTE_W](i).reduce_add())
+        if remaining > block_count:
+            remaining -= block_count
+            i += BYTE_W
+        else:
+            break
+    while i < n:
+        if flags[i] != 0:
+            remaining -= 1
+            if remaining == 0:
+                return low + 2 * i
+        i += 1
+    return -1
 
 
 @export("mps_count_constellations")

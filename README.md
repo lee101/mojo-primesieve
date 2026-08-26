@@ -32,6 +32,12 @@ upstream, the port does not accept the upper half of the unsigned 64-bit
 range. Very large stops also require all base primes through the square root
 to fit in memory.
 
+There is no GPU path. Odd-multiple crossing is an irregular, store-heavy
+kernel with well under two arithmetic operations per byte moved, and flag
+scans are directly memory-bandwidth-bound. Host/device transfers and launch
+overhead therefore have no arithmetic intensity to amortize; CPU remains the
+only execution device rather than exposing a GPU option that loses.
+
 This port does not implement upstream's C++ API, CLI, iterator range hints,
 architecture-specific wheel packaging, or bucket sieve.
 `primesieve_version()` identifies this port instead of reporting the linked
@@ -86,17 +92,17 @@ faster.
 
 | Operation | Mojo | upstream primesieve | upstream / Mojo |
 |---|---:|---:|---:|
-| `primes(10,000,000)` | 26.94 ms | 4.92 ms | 0.18x |
-| `primes(10^12, 10^12 + 5M)` | 28.25 ms | 6.39 ms | 0.23x |
-| `count_primes(100,000,000)` | 47.09 ms | 3.00 ms | 0.06x |
-| `count_twins(10,000,000)` | 13.60 ms | 1.89 ms | 0.14x |
-| `nth_prime(100,000)` | 4.00 ms | 0.09 ms | 0.02x |
+| `primes(10,000,000)` | 15.13 ms | 12.48 ms | 0.82x |
+| `primes(10^12, 10^12 + 5M)` | 15.79 ms | 7.47 ms | 0.47x |
+| `count_primes(100,000,000)` | 8.23 ms | 1.97 ms | 0.24x |
+| `count_twins(10,000,000)` | 2.49 ms | 0.88 ms | 0.35x |
+| `nth_prime(100,000)` | 1.46 ms | 0.09 ms | 0.06x |
 
 Upstream wins every measured case. Its C++ implementation uses wheel
 factorization, bit compression, cache-tuned bucket sieving, and multiple
 threads for supported operations. This port still uses one byte per odd
-candidate, and remains substantially slower on this host despite SIMD scans
-and parallel segments.
+candidate and remains slower on this host despite SIMD scans, adaptive
+segments, and parallel batches.
 
 These are measured results from `pixi run bench`, not estimates. The benchmark
 first asserts that both implementations return identical results.
@@ -116,13 +122,17 @@ rejects invalid lengths and null pointers before constructing an
 `UnsafePointer`. Mojo then fills the bytes,
 crosses out odd multiples of the base primes beginning at `max(p*p, ceil(low /
 p)*p)`, counts survivors, and optionally compacts them into a contiguous
-`int64` output buffer. Fill, survivor reduction, and direct constellation
-counting use SIMD with scalar remainder loops. Up to 32 independent 1 MiB
-segments are processed as a batch; batches with at least four segments and
-four million odd candidates use `parallelize`, while smaller work stays
-serial. The NumPy buffers pass directly through `ctypes`, and Python constructs
-`array('Q')` results through the buffer protocol instead of iterating over
-NumPy scalars.
+`uint64` output buffer. High-base ranges use a SIMD-repeated 3-by-5 presieve;
+the periodic vector copy and its remainder, survivor reduction, rank
+selection, and direct constellation counting all have scalar tail handling.
+The default uses cache-sized 256 KiB segments, coalescing them to 1 MiB when a
+large base-prime table makes repeated traversal more expensive than cache
+locality. Explicit `set_sieve_size` values are used unchanged. Up to 256
+independent segments are processed in one batch; batches with at least two
+segments and two million odd candidates use `parallelize`, while smaller work
+stays serial. The NumPy buffers pass directly through `ctypes`, collection
+writes into the final unsigned NumPy dtype, and Python constructs `array('Q')`
+results through the buffer protocol instead of iterating over NumPy scalars.
 
 The tests compare the covered numerical functions and iterator behavior with
 the installed upstream `primesieve` 2.3.4 extension. They also assert each

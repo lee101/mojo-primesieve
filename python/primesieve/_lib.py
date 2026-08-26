@@ -23,6 +23,7 @@ _SIGNATURES = {
     "mps_sieve_batch": ([I, I, P, I, P, I, P, I, I], I),
     "mps_collect_segment": ([I, P, I, P], I),
     "mps_collect_batch": ([I, P, I, I, P, I, P, I], I),
+    "mps_select_flag": ([I, P, I, I], I),
     "mps_count_constellations": ([P, I, I], I),
     "mps_count_flag_constellations": ([P, I, I], I),
 }

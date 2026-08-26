@@ -185,6 +185,10 @@ def test_simd_tail_and_parallel_threshold(ours, upstream, monkeypatch):
     original_threads = ours.get_num_threads()
     try:
         assert ours.primes(3, 69) == upstream.primes(3, 69)
+        assert ours.nth_prime(20) == upstream.nth_prime(20)
+        assert ours.primes(10**12, 10**12 + 132) == upstream.primes(
+            10**12, 10**12 + 132
+        )
         ours.set_sieve_size(16)
         ours.set_num_threads(4)
         monkeypatch.setattr(api, "_PARALLEL_MIN_ODDS", 10**18)
@@ -228,5 +232,6 @@ def test_native_boundary_rejects_null_and_invalid_lengths(ours):
     native = importlib.import_module("primesieve._lib").lib()
     assert native.mps_small_sieve(100, None, 10) == -1
     assert native.mps_small_sieve(100, None, -1) == -1
+    assert native.mps_select_flag(3, None, 10, 1) == -1
     assert native.mps_count_flag_constellations(None, 10, 2) == -1
     assert native.mps_count_flag_constellations(None, 0, 2) == 0

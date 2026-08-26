@@ -15,11 +15,13 @@ import numpy as np
 from ._lib import addr, build, checked, lib
 
 arr_type = "Q"
-_sieve_size_kib = 1024
+_DEFAULT_SIEVE_SIZE_KIB = 256
+_sieve_size_kib = _DEFAULT_SIEVE_SIZE_KIB
+_using_default_sieve_size = True
 _segment_cache: dict[int, np.ndarray] = {}
 _MAX_STOP = sys.maxsize
-_BATCH_SEGMENTS = 32
-_PARALLEL_MIN_ODDS = 4_000_000
+_BATCH_SEGMENTS = 256
+_PARALLEL_MIN_ODDS = 2_000_000
 _num_threads = os.cpu_count() or 1
 _FLAG_PATTERNS = {
     2: ((0, 1),),
@@ -81,7 +83,7 @@ def _scratch(required: int) -> np.ndarray:
 
 
 def _should_parallel(n: int, segment_capacity: int, nsegments: int) -> bool:
-    return n >= max(_PARALLEL_MIN_ODDS, 4 * segment_capacity) and nsegments >= 4
+    return n >= max(_PARALLEL_MIN_ODDS, 2 * segment_capacity) and nsegments >= 2
 
 
 def _parallel_workers(n: int, segment_capacity: int, nsegments: int) -> int:
@@ -98,6 +100,8 @@ def _sieve_batches(start: int, stop: int):
         return
     base = _small_primes(math.isqrt(stop))
     segment_capacity = max(512, _sieve_size_kib * 1024)
+    if _using_default_sieve_size and base.size > 10_000:
+        segment_capacity = max(segment_capacity, 1024 * 1024)
     batch_capacity = segment_capacity * _BATCH_SEGMENTS
     while low <= stop:
         n = min(batch_capacity, (stop - low) // 2 + 1)
@@ -129,12 +133,12 @@ def _odd_segments(start: int, stop: int):
 
 def _numpy_primes(start: int, stop: int) -> np.ndarray:
     if stop < start or stop < 2:
-        return np.empty(0, dtype=np.int64)
+        return np.empty(0, dtype=np.uint64)
     chunks: list[np.ndarray] = []
     if start <= 2 <= stop:
-        chunks.append(np.array([2], dtype=np.int64))
+        chunks.append(np.array([2], dtype=np.uint64))
     for batch_low, flags, counts, segment_capacity in _sieve_batches(start, stop):
-        values = np.empty(int(counts.sum()), dtype=np.int64)
+        values = np.empty(int(counts.sum()), dtype=np.uint64)
         offsets = np.empty(counts.size, dtype=np.int64)
         offsets[0] = 0
         np.cumsum(counts[:-1], out=offsets[1:])
@@ -145,7 +149,7 @@ def _numpy_primes(start: int, stop: int) -> np.ndarray:
             segment_capacity,
             addr(offsets, np.int64),
             counts.size,
-            addr(values, np.int64, writable=True),
+            addr(values, np.uint64, writable=True),
             _parallel_workers(flags.size, segment_capacity, counts.size),
         ), "batch collection")
         chunks.append(values)
@@ -173,7 +177,7 @@ def _nth_upper_bound(n: int) -> int:
 
 def _first_n_numpy(n: int, start: int = 0) -> np.ndarray:
     if n == 0:
-        return np.empty(0, dtype=np.int64)
+        return np.empty(0, dtype=np.uint64)
     if start <= 2:
         stop = _nth_upper_bound(n)
     else:
@@ -206,7 +210,42 @@ def nth_prime(n, start=0):
     start = _as_nonnegative(start, "start")
     if n >= 0:
         rank = max(1, n)
-        return int(_first_n_numpy(rank, min(_MAX_STOP, start + 1))[-1])
+        search_start = min(_MAX_STOP, start + 1)
+        if search_start <= 2:
+            if rank == 1:
+                return 2
+            rank -= 1
+            search_start = 3
+        stop = (
+            _nth_upper_bound(rank)
+            if search_start <= 3
+            else min(
+                _MAX_STOP,
+                search_start + max(
+                    1024,
+                    math.ceil(1.4 * rank * math.log(search_start + rank)),
+                ),
+            )
+        )
+        while True:
+            remaining = rank
+            for low, flags, counts, _ in _sieve_batches(search_start, stop):
+                batch_count = int(counts.sum())
+                if remaining <= batch_count:
+                    return checked(
+                        lib().mps_select_flag(
+                            low,
+                            addr(flags, np.uint8),
+                            flags.size,
+                            remaining,
+                        ),
+                        "rank selection",
+                    )
+                remaining -= batch_count
+            if stop == _MAX_STOP:
+                raise OverflowError("not enough representable primes")
+            span = max(1024, stop - search_start + 1)
+            stop = min(_MAX_STOP, stop + 2 * span)
     need = -n
     if start <= 2:
         raise RuntimeError("nth prime < 2 is impossible")
@@ -339,7 +378,7 @@ def get_sieve_size():
 
 
 def set_sieve_size(sieve_size):
-    global _sieve_size_kib
+    global _sieve_size_kib, _using_default_sieve_size
     try:
         size = operator.index(sieve_size)
     except TypeError:
@@ -347,6 +386,7 @@ def set_sieve_size(sieve_size):
     if not 16 <= size <= 4096:
         raise ValueError("sieve_size must be between 16 and 4096 KiB")
     _sieve_size_kib = size
+    _using_default_sieve_size = False
     _segment_cache.clear()
 
 
