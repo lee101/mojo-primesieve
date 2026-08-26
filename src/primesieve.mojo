@@ -1,11 +1,32 @@
 """Odd-only segmented sieve kernels exposed through a C ABI."""
 
-from std.algorithm import parallelize
+from std.runtime import initialize_runtime
+from std.runtime.asyncrt import TaskGroup
 from std.sys.info import simd_width_of as simdwidthof
 
 
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
+
+
+def parallelize[
+    origins: OriginSet, //, func: def(Int) capturing[origins] -> None
+](num_work_items: Int, num_workers: Int):
+    """Run work on the runtime pool without depending on max.algorithm."""
+    initialize_runtime()
+    var chunk_size, extra_items = divmod(num_work_items, num_workers)
+
+    @__parameter
+    async def run_worker(worker: Int):
+        var start = worker * chunk_size + min(worker, extra_items)
+        var count = chunk_size + Int(worker < extra_items)
+        for i in range(count):
+            func(start + i)
+
+    var tasks = TaskGroup()
+    for worker in range(min(num_workers, num_work_items)):
+        tasks.create_task(run_worker(worker))
+    tasks.wait()
 
 
 def fill_ones(flags: BPtr, n: Int):
