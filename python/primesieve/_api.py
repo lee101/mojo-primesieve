@@ -8,6 +8,7 @@ import os
 import operator
 import sys
 from collections.abc import Iterator as IteratorABC
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import numpy as np
@@ -86,10 +87,30 @@ def _should_parallel(n: int, segment_capacity: int, nsegments: int) -> bool:
     return n >= max(_PARALLEL_MIN_ODDS, 2 * segment_capacity) and nsegments >= 2
 
 
-def _parallel_workers(n: int, segment_capacity: int, nsegments: int) -> int:
+def _segment_parts(nsegments: int):
+    workers = min(_num_threads, nsegments)
+    if workers <= 1:
+        return [(0, nsegments)]
+    parts = []
+    for index in range(workers):
+        first = (index * nsegments) // workers
+        last = ((index + 1) * nsegments) // workers
+        if first < last:
+            parts.append((first, last))
+    return parts
+
+
+def _run_batches(n: int, segment_capacity: int, nsegments: int, call):
+    """Fan one batched ABI call out over a thread pool, or run it serially."""
     if _num_threads > 1 and _should_parallel(n, segment_capacity, nsegments):
-        return min(_num_threads, nsegments)
-    return 1
+        parts = _segment_parts(nsegments)
+        if len(parts) > 1:
+            with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+                for part, error in zip(parts, pool.map(call, parts)):
+                    if error:
+                        return error
+            return 0
+    return call((0, nsegments))
 
 
 def _sieve_batches(start: int, stop: int):
@@ -108,16 +129,22 @@ def _sieve_batches(start: int, stop: int):
         flags = _scratch(n)
         nsegments = (n + segment_capacity - 1) // segment_capacity
         counts = np.empty(nsegments, dtype=np.int64)
-        checked(lib().mps_sieve_batch(
-            low,
-            low + 2 * (n - 1),
-            addr(base, np.int64),
-            base.size,
-            addr(flags, np.uint8, writable=True),
+        checked(_run_batches(
+            n,
             segment_capacity,
-            addr(counts, np.int64, writable=True),
             nsegments,
-            _parallel_workers(n, segment_capacity, nsegments),
+            lambda part: lib().mps_sieve_batch_range(
+                low,
+                low + 2 * (n - 1),
+                addr(base, np.int64),
+                base.size,
+                addr(flags, np.uint8, writable=True),
+                segment_capacity,
+                addr(counts, np.int64, writable=True),
+                nsegments,
+                part[0],
+                part[1],
+            ),
         ), "batch sieve")
         yield low, flags, counts, segment_capacity
         low += 2 * n
@@ -142,15 +169,21 @@ def _numpy_primes(start: int, stop: int) -> np.ndarray:
         offsets = np.empty(counts.size, dtype=np.int64)
         offsets[0] = 0
         np.cumsum(counts[:-1], out=offsets[1:])
-        checked(lib().mps_collect_batch(
-            batch_low,
-            addr(flags, np.uint8),
+        checked(_run_batches(
             flags.size,
             segment_capacity,
-            addr(offsets, np.int64),
             counts.size,
-            addr(values, np.uint64, writable=True),
-            _parallel_workers(flags.size, segment_capacity, counts.size),
+            lambda part: lib().mps_collect_batch_range(
+                batch_low,
+                addr(flags, np.uint8),
+                flags.size,
+                segment_capacity,
+                addr(offsets, np.int64),
+                counts.size,
+                addr(values, np.uint64, writable=True),
+                part[0],
+                part[1],
+            ),
         ), "batch collection")
         chunks.append(values)
     if not chunks:

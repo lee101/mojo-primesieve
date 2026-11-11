@@ -1,7 +1,5 @@
 """Odd-only segmented sieve kernels exposed through a C ABI."""
 
-from std.runtime import initialize_runtime
-from std.runtime.asyncrt import TaskGroup
 from std.sys.info import simd_width_of as simdwidthof
 
 
@@ -9,24 +7,6 @@ comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 
 
-def parallelize[
-    origins: OriginSet, //, func: def(Int) capturing[origins] -> None
-](num_work_items: Int, num_workers: Int):
-    """Run work on the runtime pool without depending on max.algorithm."""
-    initialize_runtime()
-    var chunk_size, extra_items = divmod(num_work_items, num_workers)
-
-    @__parameter
-    async def run_worker(worker: Int):
-        var start = worker * chunk_size + min(worker, extra_items)
-        var count = chunk_size + Int(worker < extra_items)
-        for i in range(count):
-            func(start + i)
-
-    var tasks = TaskGroup()
-    for worker in range(min(num_workers, num_work_items)):
-        tasks.create_task(run_worker(worker))
-    tasks.wait()
 
 
 def fill_ones(flags: BPtr, n: Int):
@@ -57,7 +37,7 @@ def fill_presieved(flags: BPtr, low: Int, n: Int):
         comptime for vector in range(VECTORS):
             flags.store(
                 i + vector * BYTE_W,
-                flags.load[width=BYTE_W](vector * BYTE_W),
+                flags.unsafe_load[width=BYTE_W](vector * BYTE_W),
             )
         i += BLOCK
     while i < n:
@@ -75,7 +55,7 @@ def count_ones(flags: BPtr, n: Int) -> Int:
     var total = 0
     var i = 0
     while i + BYTE_W <= n:
-        total += Int(flags.load[width=BYTE_W](i).reduce_add())
+        total += Int(flags.unsafe_load[width=BYTE_W](i).reduce_add())
         i += BYTE_W
     while i < n:
         if flags[i] != 0:
@@ -173,8 +153,8 @@ def mps_segment_sieve(
     return sieve_segment(low, high, base, nbase, flags, n)
 
 
-@export("mps_sieve_batch")
-def mps_sieve_batch(
+@export("mps_sieve_batch_range")
+def mps_sieve_batch_range(
     low: Int,
     stop: Int,
     base_addr: Int,
@@ -183,20 +163,22 @@ def mps_sieve_batch(
     segment_capacity: Int,
     counts_addr: Int,
     nsegments: Int,
-    num_workers: Int,
+    first_segment: Int,
+    last_segment: Int,
 ) abi("C") -> Int:
     if (
         low < 3 or low % 2 == 0 or stop < low
         or nbase < 0 or base_addr == 0 or flags_addr == 0
         or segment_capacity < 1 or counts_addr == 0
-        or nsegments < 1 or num_workers < 1
+        or nsegments < 1
+        or first_segment < 0 or last_segment > nsegments
+        or first_segment > last_segment
     ):
         return -1
     var total_n = (stop - low) // 2 + 1
     if nsegments != (total_n + segment_capacity - 1) // segment_capacity:
         return -1
-    @parameter
-    def work(segment: Int):
+    for segment in range(first_segment, last_segment):
         var base = IPtr(unsafe_from_address=base_addr)
         var flags = BPtr(unsafe_from_address=flags_addr)
         var counts = IPtr(unsafe_from_address=counts_addr)
@@ -214,12 +196,47 @@ def mps_sieve_batch(
                 n,
             )
         )
+    return 0
 
-    if num_workers > 1:
-        parallelize[work](nsegments, num_workers)
-    else:
-        for segment in range(nsegments):
-            work(segment)
+
+@export("mps_collect_batch_range")
+def mps_collect_batch_range(
+    low: Int,
+    flags_addr: Int,
+    n: Int,
+    segment_capacity: Int,
+    offsets_addr: Int,
+    nsegments: Int,
+    values_addr: Int,
+    first_segment: Int,
+    last_segment: Int,
+) abi("C") -> Int:
+    if (
+        low < 3 or low % 2 == 0 or n < 0 or segment_capacity < 1
+        or flags_addr == 0 or offsets_addr == 0
+        or nsegments < 1
+        or first_segment < 0 or last_segment > nsegments
+        or first_segment > last_segment
+    ):
+        return -1
+    if nsegments != (n + segment_capacity - 1) // segment_capacity:
+        return -1
+    if values_addr == 0:
+        # NumPy supplies a non-null sentinel for empty arrays, but reject a
+        # genuinely null output pointer before constructing UnsafePointer.
+        return -1
+    for segment in range(first_segment, last_segment):
+        var flags = BPtr(unsafe_from_address=flags_addr)
+        var offsets = IPtr(unsafe_from_address=offsets_addr)
+        var values = IPtr(unsafe_from_address=values_addr)
+        var flag_offset = segment * segment_capacity
+        var segment_n = min(segment_capacity, n - flag_offset)
+        _ = collect_segment(
+            low + 2 * flag_offset,
+            flags + flag_offset,
+            segment_n,
+            values + Int(offsets[segment]),
+        )
     return 0
 
 
@@ -241,50 +258,6 @@ def mps_collect_segment(
     return collect_segment(low, flags, n, values)
 
 
-@export("mps_collect_batch")
-def mps_collect_batch(
-    low: Int,
-    flags_addr: Int,
-    n: Int,
-    segment_capacity: Int,
-    offsets_addr: Int,
-    nsegments: Int,
-    values_addr: Int,
-    num_workers: Int,
-) abi("C") -> Int:
-    if (
-        low < 3 or low % 2 == 0 or n < 0 or segment_capacity < 1
-        or nsegments < 1 or num_workers < 1
-        or flags_addr == 0 or offsets_addr == 0
-    ):
-        return -1
-    if nsegments != (n + segment_capacity - 1) // segment_capacity:
-        return -1
-    if values_addr == 0:
-        # NumPy supplies a non-null sentinel for empty arrays, but reject a
-        # genuinely null output pointer before constructing UnsafePointer.
-        return -1
-    @parameter
-    def work(segment: Int):
-        var flags = BPtr(unsafe_from_address=flags_addr)
-        var offsets = IPtr(unsafe_from_address=offsets_addr)
-        var values = IPtr(unsafe_from_address=values_addr)
-        var flag_offset = segment * segment_capacity
-        var segment_n = min(segment_capacity, n - flag_offset)
-        _ = collect_segment(
-            low + 2 * flag_offset,
-            flags + flag_offset,
-            segment_n,
-            values + Int(offsets[segment]),
-        )
-
-    if num_workers > 1:
-        parallelize[work](nsegments, num_workers)
-    else:
-        for segment in range(nsegments):
-            work(segment)
-    return 0
-
 
 @export("mps_select_flag")
 def mps_select_flag(
@@ -301,7 +274,7 @@ def mps_select_flag(
     var remaining = rank
     var i = 0
     while i + BYTE_W <= n:
-        var block_count = Int(flags.load[width=BYTE_W](i).reduce_add())
+        var block_count = Int(flags.unsafe_load[width=BYTE_W](i).reduce_add())
         if remaining > block_count:
             remaining -= block_count
             i += BYTE_W
@@ -399,8 +372,8 @@ def mps_count_flag_constellations(
         while i + BYTE_W + 1 <= n:
             total += Int(
                 (
-                    flags.load[width=BYTE_W](i)
-                    & flags.load[width=BYTE_W](i + 1)
+                    flags.unsafe_load[width=BYTE_W](i)
+                    & flags.unsafe_load[width=BYTE_W](i + 1)
                 ).reduce_add()
             )
             i += BYTE_W
@@ -412,14 +385,14 @@ def mps_count_flag_constellations(
     if kind == 3:
         while i + BYTE_W + 3 <= n:
             var first = (
-                flags.load[width=BYTE_W](i)
-                & flags.load[width=BYTE_W](i + 1)
-                & flags.load[width=BYTE_W](i + 3)
+                flags.unsafe_load[width=BYTE_W](i)
+                & flags.unsafe_load[width=BYTE_W](i + 1)
+                & flags.unsafe_load[width=BYTE_W](i + 3)
             )
             var second = (
-                flags.load[width=BYTE_W](i)
-                & flags.load[width=BYTE_W](i + 2)
-                & flags.load[width=BYTE_W](i + 3)
+                flags.unsafe_load[width=BYTE_W](i)
+                & flags.unsafe_load[width=BYTE_W](i + 2)
+                & flags.unsafe_load[width=BYTE_W](i + 3)
             )
             total += Int((first | second).reduce_add())
             i += BYTE_W
@@ -443,10 +416,10 @@ def mps_count_flag_constellations(
         while i + BYTE_W + 4 <= n:
             total += Int(
                 (
-                    flags.load[width=BYTE_W](i)
-                    & flags.load[width=BYTE_W](i + 1)
-                    & flags.load[width=BYTE_W](i + 3)
-                    & flags.load[width=BYTE_W](i + 4)
+                    flags.unsafe_load[width=BYTE_W](i)
+                    & flags.unsafe_load[width=BYTE_W](i + 1)
+                    & flags.unsafe_load[width=BYTE_W](i + 3)
+                    & flags.unsafe_load[width=BYTE_W](i + 4)
                 ).reduce_add()
             )
             i += BYTE_W
@@ -463,18 +436,18 @@ def mps_count_flag_constellations(
     if kind == 5:
         while i + BYTE_W + 6 <= n:
             var first = (
-                flags.load[width=BYTE_W](i)
-                & flags.load[width=BYTE_W](i + 1)
-                & flags.load[width=BYTE_W](i + 3)
-                & flags.load[width=BYTE_W](i + 4)
-                & flags.load[width=BYTE_W](i + 6)
+                flags.unsafe_load[width=BYTE_W](i)
+                & flags.unsafe_load[width=BYTE_W](i + 1)
+                & flags.unsafe_load[width=BYTE_W](i + 3)
+                & flags.unsafe_load[width=BYTE_W](i + 4)
+                & flags.unsafe_load[width=BYTE_W](i + 6)
             )
             var second = (
-                flags.load[width=BYTE_W](i)
-                & flags.load[width=BYTE_W](i + 2)
-                & flags.load[width=BYTE_W](i + 3)
-                & flags.load[width=BYTE_W](i + 5)
-                & flags.load[width=BYTE_W](i + 6)
+                flags.unsafe_load[width=BYTE_W](i)
+                & flags.unsafe_load[width=BYTE_W](i + 2)
+                & flags.unsafe_load[width=BYTE_W](i + 3)
+                & flags.unsafe_load[width=BYTE_W](i + 5)
+                & flags.unsafe_load[width=BYTE_W](i + 6)
             )
             total += Int((first | second).reduce_add())
             i += BYTE_W
@@ -502,12 +475,12 @@ def mps_count_flag_constellations(
         while i + BYTE_W + 8 <= n:
             total += Int(
                 (
-                    flags.load[width=BYTE_W](i)
-                    & flags.load[width=BYTE_W](i + 2)
-                    & flags.load[width=BYTE_W](i + 3)
-                    & flags.load[width=BYTE_W](i + 5)
-                    & flags.load[width=BYTE_W](i + 6)
-                    & flags.load[width=BYTE_W](i + 8)
+                    flags.unsafe_load[width=BYTE_W](i)
+                    & flags.unsafe_load[width=BYTE_W](i + 2)
+                    & flags.unsafe_load[width=BYTE_W](i + 3)
+                    & flags.unsafe_load[width=BYTE_W](i + 5)
+                    & flags.unsafe_load[width=BYTE_W](i + 6)
+                    & flags.unsafe_load[width=BYTE_W](i + 8)
                 ).reduce_add()
             )
             i += BYTE_W

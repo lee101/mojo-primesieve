@@ -20,9 +20,9 @@ P = ctypes.c_void_p
 _SIGNATURES = {
     "mps_small_sieve": ([I, P, I], I),
     "mps_segment_sieve": ([I, I, P, I, P, I], I),
-    "mps_sieve_batch": ([I, I, P, I, P, I, P, I, I], I),
+    "mps_sieve_batch_range": ([I, I, P, I, P, I, P, I, I, I], I),
     "mps_collect_segment": ([I, P, I, P], I),
-    "mps_collect_batch": ([I, P, I, I, P, I, P, I], I),
+    "mps_collect_batch_range": ([I, P, I, I, P, I, P, I, I], I),
     "mps_select_flag": ([I, P, I, I], I),
     "mps_count_constellations": ([P, I, I], I),
     "mps_count_flag_constellations": ([P, I, I], I),
